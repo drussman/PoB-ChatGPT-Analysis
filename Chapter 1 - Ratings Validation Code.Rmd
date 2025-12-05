@@ -1,0 +1,129 @@
+---
+title: "Ratings validation"
+output:
+  html_document:
+    df_print: paged
+---
+# human rater validation of chatgpt ratings
+
+```{r}
+#############################################
+# Interrater Reliability (ICC) Analysis Script
+# For Temple/Machine Ratings from Qualtrics
+#############################################
+
+# --- Load packages ---
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(lme4)
+library(performance)
+
+# --- Load dataset ---
+data <- read_excel("Chapter 1 - Ratings Validation Qualtrics Export.xlsx")
+
+# ---------- Combine randomized temple columns ----------
+# Your columns: "i_1temple", "i_2temple", "i_machine" for i=1..30
+for (i in 1:31) {
+  col1 <- paste0(i, "_1temple")
+  col2 <- paste0(i, "_2temple")
+  if (all(c(col1, col2) %in% names(data))) {
+    data[[paste0(i, "_temple")]] <- dplyr::coalesce(data[[col1]], data[[col2]])
+  }
+}
+# Drop old randomized temple columns
+data <- data %>% select(-matches("_[12]temple$"))
+
+# ---------- Long format ----------
+rating_cols <- grep("_(temple|machine)$", names(data), value = TRUE)
+
+long_data <- data %>%
+  mutate(participant_id = row_number()) %>%
+  pivot_longer(
+    cols = all_of(rating_cols),
+    names_to = c("stimulus", "dimension"),
+    names_pattern = "^(\\d+)_(temple|machine)$",
+    values_to = "rating",
+    values_drop_na = TRUE
+  ) %>%
+  mutate(
+    stimulus = as.integer(stimulus),
+    rating = as.numeric(rating)
+  )
+
+
+
+# ---------- Mean ratings per stimulus × dimension ----------
+avg_ratings <- long_data %>%
+  group_by(stimulus, dimension) %>%
+  summarise(
+    mean_rating = mean(rating, na.rm = TRUE),
+    sd_rating = sd(rating, na.rm = TRUE),
+    n_raters = n_distinct(participant_id[!is.na(rating)]),
+    .groups = "drop"
+  )
+
+print(avg_ratings)
+
+write_csv(avg_ratings,"avg_ratings.csv")
+
+```
+
+## calculate krippendorf's alpha for raters
+using krippendorf's
+=.219
+
+```{r}
+# overall icc
+library(irr)
+library(tidyverse)
+
+# Correct orientation: rows = stimuli×dimension (subjects), columns = participants (raters)
+rating_matrix <- long_data %>%
+  unite("stimulus_dim", stimulus, dimension, remove = FALSE) %>%
+  pivot_wider(
+    id_cols = stimulus_dim,
+    names_from = participant_id,
+    values_from = rating
+  )
+
+# Make sure rows = subjects, columns = raters
+rating_mat <- as.matrix(select(rating_matrix, -stimulus_dim))
+
+# Transpose so columns = raters (what kripp.alpha expects)
+alpha_overall <- irr::kripp.alpha(t(rating_mat), method = "ordinal")
+
+alpha_overall
+```
+overall corr = .71
+ig = .75
+meta = .49
+
+human and chatgpt not sigdiff in ratings
+meta and ig not sig diff in human ratings but ig directionally higher for chatGPT
+
+chatGPT rates body as a temple higher than machine, but human ratings no different
+
+```{r}
+corr=read_xlsx("Chapter 1 - ChatGPT Ratings Validation.xlsx")
+
+cor.test(corr$mean_rating,corr$`ChatGPT rating`)
+cor.test(subset(corr, media_type=="ig")$mean_rating,subset(corr, media_type=="ig")$`ChatGPT rating`)
+cor.test(subset(corr, media_type=="meta")$mean_rating,subset(corr, media_type=="meta")$`ChatGPT rating`)
+
+t.test(subset(corr, media_type=="meta")$mean_rating,subset(corr, media_type=="ig")$mean_rating)
+
+t.test(subset(corr, media_type=="meta")$`ChatGPT rating`,subset(corr, media_type=="ig")$`ChatGPT rating`)
+
+
+t.test(corr$mean_rating,corr$`ChatGPT rating`)
+t.test(subset(corr, media_type=="ig")$mean_rating,subset(corr, media_type=="ig")$`ChatGPT rating`)
+t.test(subset(corr, media_type=="meta")$mean_rating,subset(corr, media_type=="meta")$`ChatGPT rating`)
+t.test(subset(corr, dimension=="machine")$mean_rating,subset(corr, dimension=="machine")$`ChatGPT rating`)
+t.test(subset(corr, dimension=="temple")$mean_rating,subset(corr, dimension=="temple")$`ChatGPT rating`)
+
+t.test(subset(corr, dimension=="temple")$mean_rating,subset(corr, dimension=="machine")$mean_rating)
+t.test(subset(corr, dimension=="temple")$`ChatGPT rating`,subset(corr, dimension=="machine")$`ChatGPT rating`)
+```
+
+
