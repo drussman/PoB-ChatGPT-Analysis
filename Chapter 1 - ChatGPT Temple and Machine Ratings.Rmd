@@ -1,0 +1,616 @@
+---
+title: "ChatGPT Temple and Machine Rating"
+output: html_notebook
+---
+
+
+# ChatGPT Ratings
+
+```{r}
+# ============================================================
+# Temple vs Machine: Instagram + Meta Ads (GPT-41, PNGs + PDFs) V2
+# ============================================================
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(readxl)
+
+# ------------------------------
+# 0) API KEY
+# ------------------------------
+Sys.setenv(OPENAI_API_KEY ="Enter your API Key")
+api_key <- Sys.getenv("OPENAI_API_KEY")
+if (!nzchar(api_key)) stop("❌ OPENAI_API_KEY is not set.")
+
+
+# ------------------------------
+# 1) BRANDS & REPO CONFIG
+# ------------------------------
+
+setwd("set your working directory")
+
+# GitHub repo that holds PNGs + PDFs
+repo   <- "drussman/PoB-ChatGPT-Analysis"  # owner/repo
+branch <- "main"
+
+# Subfolders inside the repo (edit if needed)
+subdir_instagram <- ""        # e.g. "ig_pngs/"
+subdir_meta_pdf   <- ""       # e.g. "meta_pdfs/"
+
+base_url <- sprintf("https://cdn.jsdelivr.net/gh/%s@%s/", repo, branch)
+
+# Helper to safely join base + subdir + filename (URL-encoded)
+ujoin <- function(base, subdir, fname) {
+  path <- paste0(subdir, fname)
+  paste0(base, URLencode(path, reserved = TRUE))
+}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# Build media URL for a brand and slot ("ig", "meta_pdf")
+build_media_url <- function(brand, slot) {
+  fname <- switch(
+    slot,
+    "ig"       = paste0(brand, " ig.png"),    # e.g. "f45 ig.png"
+    "meta_pdf" = paste0(brand, " meta.pdf")   # e.g. "f45 meta.pdf"
+  )
+  subdir <- switch(
+    slot,
+    "ig"       = subdir_instagram,
+    "meta_pdf" = subdir_meta_pdf
+  )
+  ujoin(base_url, subdir, fname)
+}
+
+# ------------------------------
+# 2) PROMPT
+# ------------------------------
+prompt_text <- function(media_type, brand) {
+  paste0(
+"Your task is to analyze how a brand represents the body as a temple or as a machine in its messaging and imagery.\n\n",
+
+"===========================\n",
+"Part 1 — Temple vs. Machine\n",
+"===========================\n",
+"Definitions:\n",
+"• Temple: The body is portrayed as holistic, sacred, balanced, or in harmony.\n",
+"• Machine: The body is portrayed as mechanical, optimized, performance-driven, or focused on output.\n",
+"• Neither:  The content focuses on general marketing themes like convenience, affordability, or lifestyle, without clear reference to the body.\n\n",
+"Assign each dimension (temple and machine) a rating from 0 to 10, where:\n",
+"• 0 = not present at all in the media\n",
+"• 10 = completely dominant or defining of the media's representation of the body\n",
+"• Be conservative and use low values if either theme is not present.\n\n",
+
+"============================\n",
+"Part 2 — Audience Demographics\n",
+"============================\n",
+"Based ONLY on people who are actually shown or explicitly described in the media:\n",
+"• Estimate average age (0–100).\n",
+"• Estimate difference between the youngest and oldest people shown\n",
+"• Estimate percentage female (0–100).\n",
+"• Be conservative and use null if the variable cannot be inferred.\n",
+"• Do NOT guess sensitive personal attributes unless clearly depicted.\n\n",
+
+"==========================================\n",
+"Part 3 — Additional Body & Messaging Cues\n",
+"==========================================\n",
+"Rate each variable from 0–10 based on the images and text describing the people and the fitness activity.\n",
+"Be conservative and use null if the variable cannot be inferred.\n\n",
+"• muscularity: visible muscle size/definition (0–10)\n",
+"• leanness: visible low body-fat / skinniness (0–10)\n",
+"• intensity_of_activity: visible or text description of physical effort or exertion (0–10)\n",
+"• racial_ethnic_diversity: degree to which multiple groups appear represented (0–10)\n",
+"    (Rate diversity of the group overall, not individuals.)\n",
+"• tech_emphasis: presence of wearables, apps, metrics, tracking, sensors (0–10)\n",
+"• luxury_cues: premium feel, boutique aesthetic, upscale visual cues (0–10)\n",
+"• performance_cues: competition, metrics, leaderboards, PRs, athletic framing (0–10)\n",
+"• community_orientation: group classes, teamwork, social togetherness (0–10)\n",
+"• transformation_messaging: better self, self-discovery, self-changes, or transformation claims (0–10)\n",
+"• mindfulness_holistic: wellness, meditation, breath, nature, whole-person harmony cues (0–10)\n",
+"• recovery_emphasis: stretching, massage, rest, healing, recovery tools (0–10)\n",
+"• affect_emotion: written description or visible positive emotion (joy, smiling, enjoyment) (0–10)\n",
+"• beginner_friendly: description of beginners or all levels welcome or is a visibly easy activity (0–10)\n\n",
+
+"============================\n",
+"Output Format (STRICT JSON)\n",
+"============================\n",
+"Return ONLY JSON. No prose. Use null where appropriate. Follow EXACTLY this format:\n\n",
+"{\n",
+"  \"temple_rating\": number,\n",
+"  \"temple_rationale\": string,\n",
+"  \"machine_rating\": number,\n",
+"  \"machine_rationale\": string,\n",
+"  \"avg_age\": number | null,\n",
+"  \"age_range_breadth\": number | null,\n",
+"  \"pct_female\": number | null,\n",
+"  \"muscularity\": number | null,\n",
+"  \"leanness\": number | null,\n",
+"  \"intensity_of_activity\": number | null,\n",
+"  \"racial_ethnic_diversity\": number | null,\n",
+"  \"tech_emphasis\": number | null,\n",
+"  \"luxury_cues\": number | null,\n",
+"  \"performance_cues\": number | null,\n",
+"  \"community_orientation\": number | null,\n",
+"  \"transformation_messaging\": number | null,\n",
+"  \"mindfulness_holistic\": number | null,\n",
+"  \"recovery_emphasis\": number | null,\n",
+"  \"affect_emotion\": number | null,\n",
+"  \"beginner_friendly\": number | null\n",
+"}\n"
+  )
+}
+
+# ------------------------------
+# 3) Utility: numeric parser
+# ------------------------------
+parse_numeric <- function(x, min_val = -Inf, max_val = Inf) {
+  # Handle NULL or empty fields
+  if (is.null(x) || length(x) == 0) {
+    return(NA_real_)
+  }
+
+  val <- suppressWarnings(as.numeric(x))
+
+  # Handle cases where numeric conversion fails
+  if (length(val) == 0 || all(is.na(val))) {
+    return(NA_real_)
+  }
+
+  # Clamp values to allowable range
+  val <- max(min_val, min(max_val, val))
+  val
+}
+
+# ------------------------------
+# 4) IG IMAGE ANALYZER (image_url)
+# ------------------------------
+analyze_image_url <- function(img_url, brand, media_type) {
+  empty_out <- list(
+    temple_rating = NA, temple_rationale = NA,
+    machine_rating = NA, machine_rationale = NA,
+    avg_age = NA, pct_female = NA,
+    muscularity = NA,
+    leanness = NA,
+    intensity_of_activity = NA,
+    racial_ethnic_diversity = NA,
+    age_range_breadth = NA,
+    tech_emphasis = NA,
+    luxury_cues = NA,
+    performance_cues = NA,
+    community_orientation = NA,
+    transformation_messaging = NA,
+    mindfulness_holistic = NA,
+    recovery_emphasis = NA,
+    affect_emotion = NA,
+    beginner_friendly = NA
+  )
+
+  if (is.na(img_url) || !nzchar(img_url)) {
+    message("⚠️  Missing URL for ", brand, " [", media_type, "]")
+    return(empty_out)
+  }
+
+  message("🖼️  Analyzing ", brand, " [", media_type, "] → ", img_url)
+
+  body <- list(
+    model = "gpt-4.1",
+    max_tokens = 500,
+    temperature = 0,
+    seed = 123,
+    messages = list(list(
+      role = "user",
+      content = list(
+        list(type = "text", text = prompt_text(media_type, brand)),
+        list(type = "image_url", image_url = list(url = img_url, detail = "high"))
+      )
+    ))
+  )
+
+  res <- tryCatch({
+    httr::POST(
+      "https://api.openai.com/v1/chat/completions",
+      httr::add_headers(
+        Authorization = paste("Bearer", api_key),
+        `Content-Type` = "application/json"
+      ),
+      body = jsonlite::toJSON(body, auto_unbox = TRUE),
+      encode = "json",
+      httr::timeout(90)
+    )
+  }, error = function(e) {
+    message("❌ Network error for ", brand, " [", media_type, "]: ", e$message)
+    NULL
+  })
+
+  if (is.null(res)) return(empty_out)
+
+  raw_txt <- httr::content(res, as = "text", encoding = "UTF-8")
+  if (!dir.exists("cache")) dir.create("cache")
+  cache_file <- paste0("cache/", gsub("\\s+", "_", paste(brand, media_type)), "_raw.json")
+  writeLines(raw_txt, cache_file)
+
+  parsed <- suppressWarnings(tryCatch(jsonlite::fromJSON(raw_txt, simplifyVector = FALSE), error = function(e) NULL))
+  if (!is.list(parsed)) {
+    message("⚠️  Top-level parse failed for ", brand, " [", media_type, "] — see ", cache_file)
+    return(empty_out)
+  }
+  if (!is.null(parsed$error$message)) {
+    message("❌ API error for ", brand, " [", media_type, "]: ", parsed$error$message)
+    return(empty_out)
+  }
+  if (is.null(parsed$choices) || length(parsed$choices) < 1) {
+    message("⚠️  No choices returned for ", brand, " [", media_type, "]")
+    return(empty_out)
+  }
+
+  choice <- parsed$choices[[1]]
+  model_text <- choice$message$content %||% ""
+  model_text <- as.character(model_text)
+  if (!nzchar(model_text)) {
+    message("⚠️  Empty model text for ", brand, " [", media_type, "]")
+    return(empty_out)
+  }
+
+  clean_text <- gsub("```[a-zA-Z]*", "", model_text)
+  clean_text <- gsub("```", "", clean_text)
+  clean_text <- trimws(clean_text)
+
+  json_candidates <- stringr::str_extract_all(clean_text, "\\{[\\s\\S]*\\}")[[1]]
+  if (length(json_candidates) == 0) {
+    message("⚠️  No JSON block for ", brand, " [", media_type, "] — saved text.")
+    writeLines(clean_text, sub("_raw.json$", "_text.txt", cache_file))
+    return(empty_out)
+  }
+
+  for (cand in json_candidates) {
+    out <- suppressWarnings(tryCatch(jsonlite::fromJSON(cand), error = function(e) NULL))
+    if (is.null(out)) next
+
+    # Core temple/machine + demos
+    out$temple_rating           <- parse_numeric(out$temple_rating, 0, 10)
+    out$machine_rating          <- parse_numeric(out$machine_rating, 0, 10)
+    out$temple_rationale        <- out$temple_rationale  %||% NA
+    out$machine_rationale       <- out$machine_rationale %||% NA
+    out$avg_age                 <- parse_numeric(out$avg_age, 0, 100)
+    out$pct_female              <- parse_numeric(out$pct_female, 0, 100)
+
+    # Extra cues
+    out$muscularity             <- parse_numeric(out$muscularity, 0, 10)
+    out$leanness                <- parse_numeric(out$leanness, 0, 10)
+    out$intensity_of_activity   <- parse_numeric(out$intensity_of_activity, 0, 10)
+    out$racial_ethnic_diversity <- parse_numeric(out$racial_ethnic_diversity, 0, 10)
+    out$age_range_breadth       <- parse_numeric(out$age_range_breadth, 0, 100)
+    out$tech_emphasis           <- parse_numeric(out$tech_emphasis, 0, 10)
+    out$luxury_cues             <- parse_numeric(out$luxury_cues, 0, 10)
+    out$performance_cues        <- parse_numeric(out$performance_cues, 0, 10)
+    out$community_orientation   <- parse_numeric(out$community_orientation, 0, 10)
+    out$transformation_messaging<- parse_numeric(out$transformation_messaging, 0, 10)
+    out$mindfulness_holistic    <- parse_numeric(out$mindfulness_holistic, 0, 10)
+    out$recovery_emphasis       <- parse_numeric(out$recovery_emphasis, 0, 10)
+    out$affect_emotion          <- parse_numeric(out$affect_emotion, 0, 10)
+    out$beginner_friendly       <- parse_numeric(out$beginner_friendly, 0, 10)
+
+    message("✅ Parsed JSON for ", brand, " [", media_type, "]")
+    return(out)
+  }
+
+  message("⚠️  Could not parse JSON for ", brand, " [", media_type, "] — saved text.")
+  writeLines(clean_text, sub("_raw.json$", "_text.txt", cache_file))
+  empty_out
+}
+
+# ------------------------------
+# 5) PDF UPLOAD + ANALYZER (file)
+# ------------------------------
+upload_pdf_from_url <- function(pdf_url, brand, media_type) {
+  if (is.na(pdf_url) || !nzchar(pdf_url)) {
+    message("⚠️  Missing PDF URL for ", brand, " [", media_type, "]")
+    return(NA_character_)
+  }
+
+  message("⬇️  Downloading PDF for ", brand, " [", media_type, "] → ", pdf_url)
+
+  res <- tryCatch(
+    GET(pdf_url, timeout(60)),
+    error = function(e) {
+      message("❌ Download error for ", brand, " [", media_type, "]: ", e$message)
+      return(NULL)
+    }
+  )
+  if (is.null(res) || res$status_code >= 400) {
+    message("❌ Failed to download PDF for ", brand, " [", media_type, "] (status: ", res$status_code, ")")
+    return(NA_character_)
+  }
+
+  tmp <- tempfile(fileext = ".pdf")
+  writeBin(content(res, "raw"), tmp)
+
+  message("📤  Uploading PDF to OpenAI for ", brand, " [", media_type, "]")
+
+  file_res <- tryCatch(
+    POST(
+      "https://api.openai.com/v1/files",
+      add_headers(Authorization = paste("Bearer", api_key)),
+      body = list(
+        purpose = "user_data",
+        file    = upload_file(tmp)
+      ),
+      encode = "multipart"
+    ),
+    error = function(e) {
+      message("❌ File upload error for ", brand, " [", media_type, "]: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (is.null(file_res) || file_res$status_code >= 400) {
+    message("❌ OpenAI /files error for ", brand, " [", media_type, "] — status ", file_res$status_code)
+    return(NA_character_)
+  }
+
+  file_parsed <- fromJSON(content(file_res, as = "text", encoding = "UTF-8"))
+  file_id <- file_parsed$id %||% NA_character_
+
+  if (is.na(file_id)) {
+    message("⚠️  Could not extract file_id for ", brand, " [", media_type, "]")
+  } else {
+    message("✅ Got file_id ", file_id, " for ", brand, " [", media_type, "]")
+  }
+
+  file_id
+}
+
+analyze_pdf <- function(pdf_url, brand, media_type) {
+  empty_out <- list(
+    temple_rating = NA, temple_rationale = NA,
+    machine_rating = NA, machine_rationale = NA,
+    avg_age = NA, pct_female = NA,
+    muscularity = NA,
+    leanness = NA,
+    intensity_of_activity = NA,
+    racial_ethnic_diversity = NA,
+    age_range_breadth = NA,
+    tech_emphasis = NA,
+    luxury_cues = NA,
+    performance_cues = NA,
+    community_orientation = NA,
+    transformation_messaging = NA,
+    mindfulness_holistic = NA,
+    recovery_emphasis = NA,
+    affect_emotion = NA,
+    beginner_friendly = NA
+  )
+
+  file_id <- upload_pdf_from_url(pdf_url, brand, media_type)
+  if (is.na(file_id)) return(empty_out)
+
+  message("📄  Analyzing PDF for ", brand, " [", media_type, "] via file_id = ", file_id)
+
+  body <- list(
+    model = "gpt-4.1",
+    max_tokens = 500,
+    temperature = 0,
+    seed = 123,
+    messages = list(list(
+      role = "user",
+      content = list(
+        list(
+          type = "file",
+          file = list(file_id = file_id)
+        ),
+        list(
+          type = "text",
+          text = prompt_text(media_type, brand)
+        )
+      )
+    ))
+  )
+
+  res <- tryCatch({
+    httr::POST(
+      "https://api.openai.com/v1/chat/completions",
+      httr::add_headers(
+        Authorization = paste("Bearer", api_key),
+        `Content-Type` = "application/json"
+      ),
+      body = jsonlite::toJSON(body, auto_unbox = TRUE),
+      encode = "json",
+      httr::timeout(120)
+    )
+  }, error = function(e) {
+    message("❌ Chat completion error for ", brand, " [", media_type, "]: ", e$message)
+    NULL
+  })
+
+  if (is.null(res)) return(empty_out)
+
+  raw_txt <- httr::content(res, as = "text", encoding = "UTF-8")
+  if (!dir.exists("cache")) dir.create("cache")
+  cache_file <- paste0("cache/", gsub("\\s+", "_", paste(brand, media_type)), "_raw.json")
+  writeLines(raw_txt, cache_file)
+
+  parsed <- suppressWarnings(tryCatch(jsonlite::fromJSON(raw_txt, simplifyVector = FALSE), error = function(e) NULL))
+  if (!is.list(parsed)) {
+    message("⚠️  Top-level parse failed for ", brand, " [", media_type, "] — see ", cache_file)
+    return(empty_out)
+  }
+  if (!is.null(parsed$error$message)) {
+    message("❌ API error for ", brand, " [", media_type, "]: ", parsed$error$message)
+    return(empty_out)
+  }
+  if (is.null(parsed$choices) || length(parsed$choices) < 1) {
+    message("⚠️  No choices returned for ", brand, " [", media_type, "]")
+    return(empty_out)
+  }
+
+  choice <- parsed$choices[[1]]
+  model_text <- choice$message$content %||% ""
+  model_text <- as.character(model_text)
+  if (!nzchar(model_text)) {
+    message("⚠️  Empty model text for ", brand, " [", media_type, "]")
+    return(empty_out)
+  }
+
+  clean_text <- gsub("```[a-zA-Z]*", "", model_text)
+  clean_text <- gsub("```", "", clean_text)
+  clean_text <- trimws(clean_text)
+
+  json_candidates <- stringr::str_extract_all(clean_text, "\\{[\\s\\S]*\\}")[[1]]
+  if (length(json_candidates) == 0) {
+    message("⚠️  No JSON block for ", brand, " [", media_type, "] — saved text.")
+    writeLines(clean_text, sub("_raw.json$", "_text.txt", cache_file))
+    return(empty_out)
+  }
+
+  for (cand in json_candidates) {
+    out <- suppressWarnings(tryCatch(jsonlite::fromJSON(cand), error = function(e) NULL))
+    if (is.null(out)) next
+
+    # Core temple/machine + demos
+    out$temple_rating           <- parse_numeric(out$temple_rating, 0, 10)
+    out$machine_rating          <- parse_numeric(out$machine_rating, 0, 10)
+    out$temple_rationale        <- out$temple_rationale  %||% NA
+    out$machine_rationale       <- out$machine_rationale %||% NA
+    out$avg_age                 <- parse_numeric(out$avg_age, 0, 100)
+    out$pct_female              <- parse_numeric(out$pct_female, 0, 100)
+
+    # Extra cues
+    out$muscularity             <- parse_numeric(out$muscularity, 0, 10)
+    out$leanness                <- parse_numeric(out$leanness, 0, 10)
+    out$intensity_of_activity   <- parse_numeric(out$intensity_of_activity, 0, 10)
+    out$racial_ethnic_diversity <- parse_numeric(out$racial_ethnic_diversity, 0, 10)
+    out$age_range_breadth       <- parse_numeric(out$age_range_breadth, 0, 100)
+    out$tech_emphasis           <- parse_numeric(out$tech_emphasis, 0, 10)
+    out$luxury_cues             <- parse_numeric(out$luxury_cues, 0, 10)
+    out$performance_cues        <- parse_numeric(out$performance_cues, 0, 10)
+    out$community_orientation   <- parse_numeric(out$community_orientation, 0, 10)
+    out$transformation_messaging<- parse_numeric(out$transformation_messaging, 0, 10)
+    out$mindfulness_holistic    <- parse_numeric(out$mindfulness_holistic, 0, 10)
+    out$recovery_emphasis       <- parse_numeric(out$recovery_emphasis, 0, 10)
+    out$affect_emotion          <- parse_numeric(out$affect_emotion, 0, 10)
+    out$beginner_friendly       <- parse_numeric(out$beginner_friendly, 0, 10)
+
+    message("✅ Parsed JSON for ", brand, " [", media_type, "]")
+    return(out)
+  }
+
+  message("⚠️  Could not parse JSON for ", brand, " [", media_type, "] — saved text.")
+  writeLines(clean_text, sub("_raw.json$", "_text.txt", cache_file))
+  empty_out
+}
+
+# ------------------------------
+# 6) MAIN LOOP: IG + Meta PDF per brand
+# ------------------------------
+results <- map_df(brands, function(b) {
+  ig_url   <- build_media_url(b, "ig")
+  pdf_url  <- build_media_url(b, "meta_pdf")
+
+  ig   <- analyze_image_url(ig_url,   b, "Instagram page")
+  meta <- analyze_pdf(pdf_url,        b, "Meta ads PDF")
+
+  meta_temple    <- meta$temple_rating
+  meta_machine   <- meta$machine_rating
+  meta_age       <- meta$avg_age
+  meta_pct_fem   <- meta$pct_female
+
+  ig_age         <- ig$avg_age
+  ig_pct_fem     <- ig$pct_female
+
+  overall_temple  <- mean(c(meta_temple,  ig$temple_rating),  na.rm = TRUE)
+  overall_machine <- mean(c(meta_machine, ig$machine_rating), na.rm = TRUE)
+  if (is.nan(overall_temple))  overall_temple  <- NA_real_
+  if (is.nan(overall_machine)) overall_machine <- NA_real_
+
+  overall_age <- mean(c(ig_age, meta_age), na.rm = TRUE)
+  overall_pct_female <- mean(c(ig_pct_fem, meta_pct_fem), na.rm = TRUE)
+  if (is.nan(overall_age))        overall_age        <- NA_real_
+  if (is.nan(overall_pct_female)) overall_pct_female <- NA_real_
+
+  tibble(
+  brand = b,
+
+  # ==================
+  # Instagram (PNG)
+  # ==================
+  ig_temple              = ig$temple_rating,
+  ig_machine             = ig$machine_rating,
+  ig_temple_rationale    = ig$temple_rationale,
+  ig_machine_rationale   = ig$machine_rationale,
+  ig_avg_age             = ig$avg_age,
+  ig_pct_female          = ig$pct_female,
+  ig_muscularity         = ig$muscularity,
+  ig_leanness            = ig$leanness,
+  ig_intensity           = ig$intensity_of_activity,
+  ig_diversity           = ig$racial_ethnic_diversity,
+  ig_age_range_breadth   = ig$age_range_breadth,
+  ig_tech_emphasis       = ig$tech_emphasis,
+  ig_luxury_cues         = ig$luxury_cues,
+  ig_performance_cues    = ig$performance_cues,
+  ig_community           = ig$community_orientation,
+  ig_transformation      = ig$transformation_messaging,
+  ig_mindfulness         = ig$mindfulness_holistic,
+  ig_recovery            = ig$recovery_emphasis,
+  ig_affect              = ig$affect_emotion,
+  ig_beginner            = ig$beginner_friendly,
+
+  # ==================
+  # Meta Ads (PDF)
+  # ==================
+  meta_temple            = meta$temple_rating,
+  meta_machine           = meta$machine_rating,
+  meta_temple_rationale  = meta$temple_rationale,
+  meta_machine_rationale = meta$machine_rationale,
+  meta_avg_age           = meta$avg_age,
+  meta_pct_female        = meta$pct_female,
+  meta_muscularity       = meta$muscularity,
+  meta_leanness          = meta$leanness,
+  meta_intensity         = meta$intensity_of_activity,
+  meta_diversity         = meta$racial_ethnic_diversity,
+  meta_age_range_breadth = meta$age_range_breadth,
+  meta_tech_emphasis     = meta$tech_emphasis,
+  meta_luxury_cues       = meta$luxury_cues,
+  meta_performance_cues  = meta$performance_cues,
+  meta_community         = meta$community_orientation,
+  meta_transformation    = meta$transformation_messaging,
+  meta_mindfulness       = meta$mindfulness_holistic,
+  meta_recovery          = meta$recovery_emphasis,
+  meta_affect            = meta$affect_emotion,
+  meta_beginner          = meta$beginner_friendly,
+
+  # ==================
+  # Aggregates (mean of IG + Meta)
+  # ==================
+  overall_temple         = mean(c(ig$temple_rating,  meta$temple_rating),  na.rm = TRUE),
+  overall_machine        = mean(c(ig$machine_rating, meta$machine_rating), na.rm = TRUE),
+  overall_avg_age        = mean(c(ig$avg_age,        meta$avg_age),        na.rm = TRUE),
+  overall_pct_female     = mean(c(ig$pct_female,     meta$pct_female),     na.rm = TRUE),
+  overall_muscularity    = mean(c(ig$muscularity,    meta$muscularity),    na.rm = TRUE),
+  overall_leanness       = mean(c(ig$leanness,       meta$leanness),       na.rm = TRUE),
+  overall_intensity      = mean(c(ig$intensity_of_activity, meta$intensity_of_activity), na.rm = TRUE),
+  overall_diversity      = mean(c(ig$racial_ethnic_diversity, meta$racial_ethnic_diversity), na.rm = TRUE),
+  overall_age_range      = mean(c(ig$age_range_breadth, meta$age_range_breadth), na.rm = TRUE),
+  overall_tech           = mean(c(ig$tech_emphasis, meta$tech_emphasis),   na.rm = TRUE),
+  overall_luxury         = mean(c(ig$luxury_cues, meta$luxury_cues),       na.rm = TRUE),
+  overall_performance    = mean(c(ig$performance_cues, meta$performance_cues), na.rm = TRUE),
+  overall_community      = mean(c(ig$community_orientation, meta$community_orientation), na.rm = TRUE),
+  overall_transformation = mean(c(ig$transformation_messaging, meta$transformation_messaging), na.rm = TRUE),
+  overall_mindfulness    = mean(c(ig$mindfulness_holistic, meta$mindfulness_holistic), na.rm = TRUE),
+  overall_recovery       = mean(c(ig$recovery_emphasis, meta$recovery_emphasis),     na.rm = TRUE),
+  overall_affect         = mean(c(ig$affect_emotion, meta$affect_emotion),           na.rm = TRUE),
+  overall_beginner       = mean(c(ig$beginner_friendly, meta$beginner_friendly),           na.rm = TRUE)
+)
+})
+
+# ------------------------------
+# 7) SAVE
+# ------------------------------
+write_csv(results, "PoB_ChatGPT.csv")
+message("\n🎉 Done! Saved to PoB_ChatGPT.csv")
+print(results)
+
+```
